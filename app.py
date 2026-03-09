@@ -18,6 +18,7 @@ from werkzeug.utils import secure_filename
 from main import load_config, get_device, process_image_mode, process_text_mode
 from src.detector import MultiModalDetector
 from src.reid_engine import ReIDEngine
+from src.segmentor import SAMSegmentor
 from src.video_tools import export_poi_clip
 
 app = Flask(__name__)
@@ -50,13 +51,21 @@ def _run_image_pipeline(job_id: str, video_path: str, ref_dir: str, output_path:
         detector = MultiModalDetector(cfg)
         detector.init_image_mode()
 
+        # Load SAM segmentor
+        segmentor = None
+        if cfg.get("use_sam", True):
+            segmentor = SAMSegmentor(cfg)
+            segmentor.load()
+
         jobs[job_id]["status"] = "encoding_references"
         reid = ReIDEngine(cfg, device)
         reid.load()
-        gold = reid.encode_references(ref_dir, augment=cfg.get("ref_augment", True), detector=detector)
+        gold = reid.encode_references(ref_dir, augment=cfg.get("ref_augment", True),
+                                      detector=detector, segmentor=segmentor)
 
         jobs[job_id]["status"] = "processing_video"
-        segments, annotated = process_image_mode(detector, reid, gold, video_path, cfg)
+        segments, annotated = process_image_mode(detector, reid, gold, video_path, cfg,
+                                                 segmentor=segmentor)
 
         if segments:
             jobs[job_id]["status"] = "exporting_clip"

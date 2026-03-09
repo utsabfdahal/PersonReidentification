@@ -79,11 +79,11 @@ class ReIDEngine:
             augments.append(img_bgr[mh:h - mh, mw:w - mw])
         return augments
 
-    def encode_references(self, ref_dir: str, augment: bool = True, detector=None) -> dict[str, np.ndarray]:
+    def encode_references(self, ref_dir: str, augment: bool = True, detector=None, segmentor=None) -> dict[str, np.ndarray]:
         """Encode reference images.  If *detector* is provided, run YOLO
         person detection first and use the largest person crop rather than
-        the raw full image.  This is **critical** because OSNet expects
-        tight person crops, not arbitrary scene images."""
+        the raw full image.  If *segmentor* (SAM) is also provided, the
+        crop is background-masked for a cleaner embedding."""
         if not os.path.isdir(ref_dir):
             log.error("Reference directory not found: %s", ref_dir)
             sys.exit(1)
@@ -104,10 +104,17 @@ class ReIDEngine:
             if detector is not None:
                 person_boxes = detector.detect_persons(fpath)
                 if person_boxes:
-                    x1, y1, x2, y2 = person_boxes[0]  # largest person
-                    person_img = img[y1:y2, x1:x2]
-                    log.info("Cropped person from '%s': (%d,%d)-(%d,%d) [%dx%d].",
-                             fname, x1, y1, x2, y2, x2 - x1, y2 - y1)
+                    bbox = person_boxes[0]  # largest person
+                    x1, y1, x2, y2 = bbox
+                    # Use SAM to mask background if available
+                    if segmentor is not None:
+                        person_img = segmentor.masked_crop(img, bbox)
+                        log.info("SAM-masked person from '%s': (%d,%d)-(%d,%d).",
+                                 fname, x1, y1, x2, y2)
+                    else:
+                        person_img = img[y1:y2, x1:x2]
+                        log.info("Cropped person from '%s': (%d,%d)-(%d,%d) [%dx%d].",
+                                 fname, x1, y1, x2, y2, x2 - x1, y2 - y1)
                 else:
                     log.warning("No person detected in '%s' — using full image.", fname)
 

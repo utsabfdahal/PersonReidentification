@@ -4,6 +4,7 @@ video_tools.py — Drawing, segment math, and video export
 """
 
 import os
+import subprocess
 import sys
 import logging
 
@@ -22,11 +23,19 @@ def draw_poi_box(
     x1: int, y1: int, x2: int, y2: int,
     label: str,
     cfg: dict,
+    mask: np.ndarray | None = None,
 ) -> None:
-    """Draw a bounding box and label on *frame* in-place."""
+    """Draw a bounding box, label, and optional SAM mask on *frame* in-place."""
     color = cfg["bbox_color"]
     thick = cfg["bbox_thickness"]
-    cv2.rectangle(frame, (x1, y1), (x2, y2), color, thick)
+
+    # Draw SAM segmentation overlay if mask is provided
+    if mask is not None:
+        from src.segmentor import SAMSegmentor
+        SAMSegmentor.draw_mask_contour(frame, mask, color=color, thickness=thick)
+    else:
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, thick)
+
     font = cv2.FONT_HERSHEY_SIMPLEX
     scale = cfg["label_font_scale"]
     (tw, th), baseline = cv2.getTextSize(label, font, scale, 1)
@@ -107,7 +116,8 @@ def export_poi_clip(
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
+    temp_path = output_path + ".tmp.mp4"
+    writer = cv2.VideoWriter(temp_path, fourcc, fps, (w, h))
 
     for si, (ss, se) in enumerate(segments):
         sf = int(ss * fps)
@@ -122,4 +132,30 @@ def export_poi_clip(
 
     writer.release()
     cap.release()
+
+    # Re-encode to H.264 so browsers can play the video inline
+    _reencode_h264(temp_path, output_path)
     log.info("POI clip saved → %s", output_path)
+
+
+def _reencode_h264(src: str, dst: str) -> None:
+    """Re-encode *src* (mp4v) to *dst* (H.264/AAC) using ffmpeg.
+    Falls back to the mp4v file if ffmpeg is unavailable."""
+    try:
+        cmd = [
+            "ffmpeg", "-y", "-i", src,
+            "-c:v", "libx264", "-preset", "fast",
+            "-crf", "23", "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            "-an",  # no audio track needed
+            dst,
+        ]
+        subprocess.run(cmd, check=True, capture_output=True)
+        os.remove(src)
+        log.info("Re-encoded to H.264: %s", dst)
+    except FileNotFoundError:
+        log.warning("ffmpeg not found — keeping mp4v file (may not play in browsers).")
+        os.rename(src, dst)
+    except subprocess.CalledProcessError as e:
+        log.warning("ffmpeg re-encode failed: %s — keeping mp4v file.", e.stderr.decode()[-200:])
+        os.rename(src, dst)

@@ -29,6 +29,7 @@ import yaml
 
 from src.detector import MultiModalDetector
 from src.reid_engine import ReIDEngine
+from src.segmentor import SAMSegmentor
 from src.video_tools import draw_poi_box, frames_to_segments, export_poi_clip
 
 logging.basicConfig(
@@ -116,6 +117,7 @@ def process_image_mode(
     gold_embeddings: dict[str, np.ndarray],
     video_path: str,
     cfg: dict,
+    segmentor: SAMSegmentor | None = None,
 ) -> tuple[list[tuple[float, float]], dict[int, np.ndarray]]:
     """Run detection + tracking + ReID (image mode)."""
     cap = cv2.VideoCapture(video_path)
@@ -128,6 +130,7 @@ def process_image_mode(
     confirmed: set[int] = set()
     poi_frames: list[int] = []
     annotated: dict[int, np.ndarray] = {}
+    use_sam_video = cfg.get("sam_on_video", False) and segmentor is not None
 
     frame_idx = 0
     for result in detector.track(source=video_path):
@@ -144,7 +147,14 @@ def process_image_mode(
             x1, y1, x2, y2 = map(int, xyxy)
             if (x2 - x1) < cfg["min_box_size"] or (y2 - y1) < cfg["min_box_size"]:
                 continue
-            crop = result.orig_img[y1:y2, x1:x2]
+
+            bbox = (x1, y1, x2, y2)
+
+            # Use SAM-masked crop for ReID if enabled
+            if use_sam_video:
+                crop = segmentor.masked_crop(result.orig_img, bbox)
+            else:
+                crop = result.orig_img[y1:y2, x1:x2]
             if crop.size == 0:
                 continue
 
@@ -162,8 +172,12 @@ def process_image_mode(
             if tid in confirmed or is_match:
                 poi_here = True
                 ref_label = os.path.splitext(matched_name)[0]
+                # Get SAM mask for visualization on confirmed POIs
+                mask = None
+                if segmentor is not None and tid in confirmed:
+                    mask = segmentor.segment_box(result.orig_img, bbox)
                 draw_poi_box(frame_bgr, x1, y1, x2, y2,
-                             f"POI:{ref_label} ID:{tid} {sim:.2f}", cfg)
+                             f"POI:{ref_label} ID:{tid} {sim:.2f}", cfg, mask=mask)
 
         if poi_here:
             poi_frames.append(frame_idx)
@@ -284,6 +298,12 @@ def main() -> None:
     device = get_device()
     detector = MultiModalDetector(cfg)
 
+    # --- SAM segmentor (optional but recommended) ---
+    segmentor = None
+    if cfg.get("use_sam", True):
+        segmentor = SAMSegmentor(cfg)
+        segmentor.load()
+
     start = time.time()
 
     if args.image:
@@ -298,8 +318,10 @@ def main() -> None:
         reid = ReIDEngine(cfg, device)
         reid.load()
 
-        gold = reid.encode_references(ref_dir, augment=cfg.get("ref_augment", True), detector=detector)
-        segments, annotated = process_image_mode(detector, reid, gold, video_path, cfg)
+        gold = reid.encode_references(ref_dir, augment=cfg.get("ref_augment", True),
+                                      detector=detector, segmentor=segmentor)
+        segments, annotated = process_image_mode(detector, reid, gold, video_path, cfg,
+                                                 segmentor=segmentor)
 
     else:
         # ---- Engine B: Semantic Grounding (Text) ----
