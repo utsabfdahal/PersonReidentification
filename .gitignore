@@ -1,0 +1,28 @@
+# Virtual environment
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# YOLO model weights
+*.pt
+
+# macOS
+.DS_Store
+
+# Uploads & outputs (user data)
+uploads/
+output/
+
+# Input videos (too large for git)
+input/
+*.mp4
+
+# IDE
+.vscode/
+.idea/

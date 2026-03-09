@@ -1,0 +1,39 @@
+# ============================================================
+#  POI Tracker — Configuration
+# ============================================================
+
+# --- Models ---
+yolo_model: "yolo11n.pt"               # Standard YOLO for image-mode detection
+yolo_world_model: "yolov8s-worldv2.pt"  # YOLO-World for text-mode detection
+reid_model_name: "osnet_x1_0"           # OSNet variant for ReID embeddings
+reid_input_size: [256, 128]              # (height, width)
+
+# --- Detection ---
+person_class_id: 0
+conf_threshold: 0.30           # YOLO confidence (lower = more recall)
+min_box_size: 30               # skip crops smaller than this (px)
+
+# --- ReID (image mode) ---
+similarity_threshold: 0.70    # cosine similarity cutoff
+ref_augment: true              # create augmented reference embeddings
+voting_window: 10              # recent frames considered for confirmation
+voting_ratio: 0.6              # fraction that must match to confirm
+
+# --- Text mode ---
+text_conf_threshold: 0.25     # YOLO-World is noisier — be more lenient
+text_voting_window: 8
+text_voting_ratio: 0.5
+
+# --- Video export ---
+buffer_seconds: 1.0           # padding before/after POI segments
+
+# --- Drawing ---
+bbox_color: [0, 255, 0]       # BGR green
+bbox_thickness: 2
+label_font_scale: 0.6
+
+# --- Paths (defaults — overridden by CLI / web UI) ---
+input_video: "input/input_video.mp4"
+ref_dir: "ref"
+output_dir: "output"
+output_clip: "output/poi_only_clip.mp4"
