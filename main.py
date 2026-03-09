@@ -29,8 +29,7 @@ import yaml
 
 from src.detector import MultiModalDetector
 from src.reid_engine import ReIDEngine
-from src.segmentor import SAMSegmentor
-from src.video_tools import draw_poi_box, frames_to_segments, export_poi_clip
+from src.video_tools import draw_poi_box, frames_to_segments, export_poi_clip, downsample_video
 
 logging.basicConfig(
     level=logging.INFO,
@@ -76,6 +75,9 @@ def load_config(path: str = "config.yaml") -> dict:
         "ref_augment": True,
         "voting_window": 10,
         "voting_ratio": 0.6,
+        "reid_budget": 5,
+        "reject_after": 10,
+        "detection_fps": 12,
         "text_conf_threshold": 0.25,
         "text_voting_window": 8,
         "text_voting_ratio": 0.5,
@@ -117,23 +119,44 @@ def process_image_mode(
     gold_embeddings: dict[str, np.ndarray],
     video_path: str,
     cfg: dict,
-    segmentor: SAMSegmentor | None = None,
 ) -> tuple[list[tuple[float, float]], dict[int, np.ndarray]]:
-    """Run detection + tracking + ReID (image mode)."""
-    cap = cv2.VideoCapture(video_path)
+    """Run detection + tracking + ReID (image mode).
+
+    Optimised approach:
+      1. YOLO + ByteTrack gives each person a persistent track ID.
+      2. For each *new* track ID, we run OSNet on up to ``reid_budget``
+         crops and accumulate match votes.
+      3. Once a track is confirmed as POI (vote ratio met) or rejected
+         (enough negative checks), the decision is cached and OSNet is
+         never called for that track again.
+      4. Confirmed-POI tracks are annotated in every subsequent frame
+         without any embedding work.
+    """
+    # --- Downsample for faster detection ---
+    det_fps = cfg.get("detection_fps", 12)
+    det_video = downsample_video(video_path, det_fps)
+    detection_source = det_video if det_video else video_path
+
+    cap = cv2.VideoCapture(detection_source)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
-    log.info("Video: %s | FPS=%.2f | Frames=%d", video_path, fps, total)
+    log.info("Detection video: %s | FPS=%.2f | Frames=%d", detection_source, fps, total)
 
+    # --- Track-level state ---
     track_votes: dict[int, list[bool]] = defaultdict(list)
-    confirmed: set[int] = set()
+    confirmed_poi: set[int] = set()          # OSNet says YES — never re-check
+    rejected: set[int] = set()               # OSNet says NO  — never re-check
+    track_best_match: dict[int, tuple[str, float]] = {}  # tid → (ref_name, best_sim)
+
+    reid_budget = cfg.get("reid_budget", 5)
+    reject_after = cfg.get("reject_after", 10)
+
     poi_frames: list[int] = []
     annotated: dict[int, np.ndarray] = {}
-    use_sam_video = cfg.get("sam_on_video", False) and segmentor is not None
 
     frame_idx = 0
-    for result in detector.track(source=video_path):
+    for result in detector.track(source=detection_source):
         if result.boxes is None or len(result.boxes) == 0 or result.boxes.id is None:
             frame_idx += 1
             continue
@@ -150,34 +173,61 @@ def process_image_mode(
 
             bbox = (x1, y1, x2, y2)
 
-            # Use SAM-masked crop for ReID if enabled
-            if use_sam_video:
-                crop = segmentor.masked_crop(result.orig_img, bbox)
-            else:
-                crop = result.orig_img[y1:y2, x1:x2]
-            if crop.size == 0:
+            # --- Already decided ---
+            if tid in rejected:
+                continue                     # skip entirely, no drawing
+
+            if tid in confirmed_poi:
+                # Draw without running OSNet
+                poi_here = True
+                ref_label, best_sim = track_best_match.get(tid, ("?", 0.0))
+                ref_label = os.path.splitext(ref_label)[0]
+                draw_poi_box(frame_bgr, x1, y1, x2, y2,
+                             f"POI:{ref_label} ID:{tid} {best_sim:.2f}", cfg)
                 continue
 
-            emb = reid.extract_embedding(crop)
-            is_match, sim, matched_name = reid.match_any(emb, gold_embeddings, cfg["similarity_threshold"])
-            track_votes[tid].append(is_match)
+            # --- Undecided: run OSNet (within budget) ---
+            checks_done = len(track_votes[tid])
 
-            if tid not in confirmed:
+            if checks_done < max(reid_budget, reject_after):
+                crop = result.orig_img[y1:y2, x1:x2]
+                if crop.size == 0:
+                    continue
+
+                emb = reid.extract_embedding(crop)
+                is_match, sim, matched_name = reid.match_any(emb, gold_embeddings, cfg["similarity_threshold"])
+                track_votes[tid].append(is_match)
+
+                # Track the best similarity seen so far for labelling
+                prev_best = track_best_match.get(tid, ("", -1.0))
+                if sim > prev_best[1]:
+                    track_best_match[tid] = (matched_name, sim)
+
+                # Check for early confirmation
                 w = cfg["voting_window"]
                 recent = track_votes[tid][-w:]
-                if len(recent) >= w and sum(recent) >= int(w * cfg["voting_ratio"]):
-                    confirmed.add(tid)
-                    log.info("Track ID %d confirmed as POI (%d/%d).", tid, sum(recent), w)
+                if len(recent) >= min(w, reid_budget) and sum(recent) >= int(len(recent) * cfg["voting_ratio"]):
+                    confirmed_poi.add(tid)
+                    log.info("Track ID %d CONFIRMED as POI after %d checks (%.0f%% match).",
+                             tid, checks_done + 1,
+                             100.0 * sum(recent) / len(recent))
 
-            if tid in confirmed or is_match:
-                poi_here = True
-                ref_label = os.path.splitext(matched_name)[0]
-                # Get SAM mask for visualization on confirmed POIs
-                mask = None
-                if segmentor is not None and tid in confirmed:
-                    mask = segmentor.segment_box(result.orig_img, bbox)
-                draw_poi_box(frame_bgr, x1, y1, x2, y2,
-                             f"POI:{ref_label} ID:{tid} {sim:.2f}", cfg, mask=mask)
+                # Check for rejection
+                if checks_done + 1 >= reject_after and tid not in confirmed_poi:
+                    recent_all = track_votes[tid][-reject_after:]
+                    if sum(recent_all) < int(len(recent_all) * cfg["voting_ratio"]):
+                        rejected.add(tid)
+                        log.info("Track ID %d REJECTED after %d checks (%d/%d matches).",
+                                 tid, checks_done + 1,
+                                 sum(recent_all), len(recent_all))
+                        continue
+
+                # Draw if currently matching or already confirmed
+                if tid in confirmed_poi or is_match:
+                    poi_here = True
+                    ref_label = os.path.splitext(matched_name)[0]
+                    draw_poi_box(frame_bgr, x1, y1, x2, y2,
+                                 f"POI:{ref_label} ID:{tid} {sim:.2f}", cfg)
 
         if poi_here:
             poi_frames.append(frame_idx)
@@ -185,9 +235,16 @@ def process_image_mode(
 
         frame_idx += 1
         if frame_idx % 500 == 0:
-            log.info("Processed %d / %d frames …", frame_idx, total)
+            log.info("Processed %d / %d frames  (POI tracks: %d, rejected: %d) …",
+                     frame_idx, total, len(confirmed_poi), len(rejected))
 
-    log.info("POI detected in %d / %d frames.", len(poi_frames), total)
+    # Clean up temp downsampled video
+    if det_video and os.path.isfile(det_video):
+        os.remove(det_video)
+        log.info("Removed temp detection video: %s", det_video)
+
+    log.info("POI detected in %d / %d frames.  Confirmed tracks: %s",
+             len(poi_frames), total, confirmed_poi or "none")
     segments = frames_to_segments(poi_frames, fps, cfg["buffer_seconds"], total)
     return segments, annotated
 
@@ -206,11 +263,16 @@ def process_text_mode(
     Every detection already IS the POI (the model only looks for the prompt).
     We still use voting on track IDs to reduce false positives.
     """
-    cap = cv2.VideoCapture(video_path)
+    # --- Downsample for faster detection ---
+    det_fps = cfg.get("detection_fps", 12)
+    det_video = downsample_video(video_path, det_fps)
+    detection_source = det_video if det_video else video_path
+
+    cap = cv2.VideoCapture(detection_source)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
-    log.info("Video: %s | FPS=%.2f | Frames=%d", video_path, fps, total)
+    log.info("Detection video: %s | FPS=%.2f | Frames=%d", detection_source, fps, total)
 
     track_votes: dict[int, list[bool]] = defaultdict(list)
     confirmed: set[int] = set()
@@ -218,7 +280,7 @@ def process_text_mode(
     annotated: dict[int, np.ndarray] = {}
 
     frame_idx = 0
-    for result in detector.track(source=video_path):
+    for result in detector.track(source=detection_source):
         if result.boxes is None or len(result.boxes) == 0 or result.boxes.id is None:
             frame_idx += 1
             continue
@@ -256,6 +318,11 @@ def process_text_mode(
         frame_idx += 1
         if frame_idx % 500 == 0:
             log.info("Processed %d / %d frames …", frame_idx, total)
+
+    # Clean up temp downsampled video
+    if det_video and os.path.isfile(det_video):
+        os.remove(det_video)
+        log.info("Removed temp detection video: %s", det_video)
 
     log.info("POI detected in %d / %d frames.", len(poi_frames), total)
     segments = frames_to_segments(poi_frames, fps, cfg["buffer_seconds"], total)
@@ -298,12 +365,6 @@ def main() -> None:
     device = get_device()
     detector = MultiModalDetector(cfg)
 
-    # --- SAM segmentor (optional but recommended) ---
-    segmentor = None
-    if cfg.get("use_sam", True):
-        segmentor = SAMSegmentor(cfg)
-        segmentor.load()
-
     start = time.time()
 
     if args.image:
@@ -319,9 +380,8 @@ def main() -> None:
         reid.load()
 
         gold = reid.encode_references(ref_dir, augment=cfg.get("ref_augment", True),
-                                      detector=detector, segmentor=segmentor)
-        segments, annotated = process_image_mode(detector, reid, gold, video_path, cfg,
-                                                 segmentor=segmentor)
+                                      detector=detector)
+        segments, annotated = process_image_mode(detector, reid, gold, video_path, cfg)
 
     else:
         # ---- Engine B: Semantic Grounding (Text) ----

@@ -7,20 +7,20 @@ yolo_model: "yolo11n.pt"               # Standard YOLO for image-mode detection
 yolo_world_model: "yolov8s-worldv2.pt"  # YOLO-World for text-mode detection
 reid_model_name: "osnet_x1_0"           # OSNet variant for ReID embeddings
 reid_input_size: [256, 128]              # (height, width)
-sam_model: "mobile_sam.pt"              # MobileSAM for person segmentation
-use_sam: true                            # enable SAM for reference & visualization
-sam_on_video: false                      # SAM on every video crop (slower but better ReID)
 
 # --- Detection ---
 person_class_id: 0
 conf_threshold: 0.30           # YOLO confidence (lower = more recall)
 min_box_size: 30               # skip crops smaller than this (px)
+detection_fps: 12              # downsample video to this FPS for detection (saves ~50% time)
 
 # --- ReID (image mode) ---
 similarity_threshold: 0.70    # cosine similarity cutoff
 ref_augment: true              # create augmented reference embeddings
 voting_window: 10              # recent frames considered for confirmation
 voting_ratio: 0.6              # fraction that must match to confirm
+reid_budget: 5                 # max OSNet checks per track before locking decision
+reject_after: 10               # reject track as non-POI after this many failed checks
 
 # --- Text mode ---
 text_conf_threshold: 0.25     # YOLO-World is noisier — be more lenient

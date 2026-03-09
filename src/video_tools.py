@@ -7,11 +7,58 @@ import os
 import subprocess
 import sys
 import logging
+import tempfile
 
 import cv2
 import numpy as np
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Preprocessing — FPS downsampling
+# ---------------------------------------------------------------------------
+
+def downsample_video(video_path: str, target_fps: float) -> str | None:
+    """Create a temporary copy of *video_path* re-encoded at *target_fps*.
+
+    Returns the path to the temp file, or ``None`` if the source FPS is
+    already at or below *target_fps* (no work needed).  The caller is
+    responsible for deleting the temp file when done.
+    """
+    cap = cv2.VideoCapture(video_path)
+    src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    cap.release()
+
+    if src_fps <= target_fps:
+        log.info("Video FPS (%.1f) already <= target (%.1f) — skipping downsample.",
+                 src_fps, target_fps)
+        return None
+
+    suffix = os.path.splitext(video_path)[1] or ".mp4"
+    fd, tmp_path = tempfile.mkstemp(suffix=suffix, prefix="det_")
+    os.close(fd)
+
+    log.info("Downsampling video %.1f → %.1f FPS: %s", src_fps, target_fps, tmp_path)
+    try:
+        cmd = [
+            "ffmpeg", "-y", "-i", video_path,
+            "-filter:v", f"fps={target_fps}",
+            "-c:v", "libx264", "-preset", "ultrafast",
+            "-crf", "18", "-pix_fmt", "yuv420p",
+            "-an", tmp_path,
+        ]
+        subprocess.run(cmd, check=True, capture_output=True)
+        log.info("Downsampled video ready: %s", tmp_path)
+        return tmp_path
+    except FileNotFoundError:
+        log.warning("ffmpeg not found — cannot downsample; using original FPS.")
+        os.remove(tmp_path)
+        return None
+    except subprocess.CalledProcessError as e:
+        log.warning("ffmpeg downsample failed: %s", e.stderr.decode()[-300:])
+        os.remove(tmp_path)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -23,18 +70,11 @@ def draw_poi_box(
     x1: int, y1: int, x2: int, y2: int,
     label: str,
     cfg: dict,
-    mask: np.ndarray | None = None,
 ) -> None:
-    """Draw a bounding box, label, and optional SAM mask on *frame* in-place."""
+    """Draw a bounding box and label on *frame* in-place."""
     color = cfg["bbox_color"]
     thick = cfg["bbox_thickness"]
-
-    # Draw SAM segmentation overlay if mask is provided
-    if mask is not None:
-        from src.segmentor import SAMSegmentor
-        SAMSegmentor.draw_mask_contour(frame, mask, color=color, thickness=thick)
-    else:
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, thick)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, thick)
 
     font = cv2.FONT_HERSHEY_SIMPLEX
     scale = cfg["label_font_scale"]
